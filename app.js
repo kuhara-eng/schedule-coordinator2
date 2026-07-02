@@ -9,6 +9,7 @@ let appState = loadAppState();
 let state = getActiveMeeting();
 let selectedParticipantId = state.participants[0]?.id || null;
 let activeView = "input";
+let ignoreNextRealtime = false;
 let dragState = null;
 let cloud = {
   client: null,
@@ -249,13 +250,31 @@ async function loadSharedBoard() {
 
 function subscribeSharedBoard() {
   if (!cloud.client || !cloud.shareId) return;
-  if (cloud.channel) cloud.client.removeChannel(cloud.channel);
+
+  if (cloud.channel) {
+    cloud.client.removeChannel(cloud.channel);
+  }
+
   cloud.channel = cloud.client
     .channel(`schedule-board:${cloud.shareId}`)
     .on(
       "postgres_changes",
-      { event: "UPDATE", schema: "public", table: "schedule_boards", filter: `share_id=eq.${cloud.shareId}` },
-      (payload) => applyRemoteState(payload.new?.data)
+      {
+        event: "UPDATE",
+        schema: "public",
+        table: "schedule_boards",
+        filter: `share_id=eq.${cloud.shareId}`,
+      },
+      (payload) => {
+
+        // 自分が保存した更新なら無視
+        if (ignoreNextRealtime) {
+          ignoreNextRealtime = false;
+          return;
+        }
+
+        applyRemoteState(payload.new?.data);
+      }
     )
     .subscribe();
 }
@@ -268,7 +287,9 @@ function applyRemoteState(remoteState) {
   cloud.applyingRemote = true;
   appState = normalizeAppState(remoteState);
   syncActiveMeeting();
-  selectedParticipantId = state.participants[0]?.id || null;
+  if (!state.participants.some(p => p.id === selectedParticipantId)) {
+    selectedParticipantId = state.participants[0]?.id || null;
+}
   localStorage.setItem(STORAGE_KEY, JSON.stringify(appState));
   cloud.applyingRemote = false;
   render();
@@ -282,17 +303,22 @@ function scheduleCloudSave() {
 
 async function saveSharedBoardNow() {
   if (!cloud.client || !cloud.shareId) return;
+
+  // 自分の更新通知を1回だけ無視する
+  ignoreNextRealtime = true;
+
   const { error } = await cloud.client.from("schedule_boards").upsert({
     share_id: cloud.shareId,
     data: appState,
     updated_at: new Date().toISOString(),
   });
+
   if (error) {
+    ignoreNextRealtime = false;
     console.error(error);
     renderCloudStatus("共有データの保存に失敗しました。Supabase設定を確認してください。");
   }
 }
-
 function getShareIdFromUrl() {
   return new URLSearchParams(window.location.search).get("board") || "";
 }
