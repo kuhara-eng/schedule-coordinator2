@@ -1,30 +1,105 @@
+-- schedule-coordinator secure sharing schema
+-- URLに含まれる board/share_id と token/access_token の両方が一致した場合だけRPC経由で読み書きできます。
+
+create extension if not exists pgcrypto;
+
 create table if not exists public.schedule_boards (
   share_id text primary key,
+  access_token text not null,
   data jsonb not null default '{}'::jsonb,
   updated_at timestamptz not null default now()
 );
+
+alter table public.schedule_boards
+  add column if not exists access_token text;
+
+update public.schedule_boards
+set access_token = encode(gen_random_bytes(32), 'hex')
+where access_token is null;
+
+alter table public.schedule_boards
+  alter column access_token set not null;
+
+create unique index if not exists schedule_boards_share_token_idx
+  on public.schedule_boards (share_id, access_token);
 
 alter table public.schedule_boards enable row level security;
 
 drop policy if exists "schedule_boards_select" on public.schedule_boards;
 drop policy if exists "schedule_boards_insert" on public.schedule_boards;
 drop policy if exists "schedule_boards_update" on public.schedule_boards;
+drop policy if exists "schedule_boards_no_direct_select" on public.schedule_boards;
+drop policy if exists "schedule_boards_no_direct_insert" on public.schedule_boards;
+drop policy if exists "schedule_boards_no_direct_update" on public.schedule_boards;
+drop policy if exists "schedule_boards_realtime_select" on public.schedule_boards;
 
-create policy "schedule_boards_select"
+-- anonからの直接SELECT/INSERT/UPDATEは許可しません。
+-- 読み書きは下のSECURITY DEFINER RPCだけを使います。
+create policy "schedule_boards_no_direct_select"
   on public.schedule_boards for select
   to anon
-  using (true);
+  using (false);
 
-create policy "schedule_boards_insert"
+create policy "schedule_boards_no_direct_insert"
   on public.schedule_boards for insert
   to anon
-  with check (true);
+  with check (false);
 
-create policy "schedule_boards_update"
+create policy "schedule_boards_no_direct_update"
   on public.schedule_boards for update
   to anon
-  using (true)
-  with check (true);
+  using (false)
+  with check (false);
 
--- Supabase Dashboard > Database > Replication で
--- schedule_boards のRealtimeを有効にしてください。
+create or replace function public.get_schedule_board(
+  p_share_id text,
+  p_access_token text
+)
+returns jsonb
+language sql
+security definer
+set search_path = public
+as $$
+  select data
+  from public.schedule_boards
+  where share_id = p_share_id
+    and access_token = p_access_token
+  limit 1;
+$$;
+
+create or replace function public.upsert_schedule_board(
+  p_share_id text,
+  p_access_token text,
+  p_data jsonb
+)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  insert into public.schedule_boards (share_id, access_token, data, updated_at)
+  values (p_share_id, p_access_token, p_data, now())
+  on conflict (share_id) do update
+    set data = excluded.data,
+        updated_at = now()
+    where public.schedule_boards.access_token = excluded.access_token;
+
+  if not found then
+    raise exception 'schedule board not found or access token mismatch'
+      using errcode = '42501';
+  end if;
+end;
+$$;
+
+revoke all on table public.schedule_boards from anon, authenticated;
+revoke all on function public.get_schedule_board(text, text) from public;
+revoke all on function public.upsert_schedule_board(text, text, jsonb) from public;
+
+grant execute on function public.get_schedule_board(text, text) to anon;
+grant execute on function public.upsert_schedule_board(text, text, jsonb) to anon;
+
+-- Realtimeを使う場合:
+-- Supabase Dashboard > Database > Replication で schedule_boards のRealtimeを有効にしてください。
+-- 注意: Realtimeのpayloadには行データが含まれます。アプリ側ではshare_id購読後にaccess_tokenを照合して
+--       不一致の更新を無視します。より厳密にpayload露出も避けたい場合は、Realtime Broadcast + Edge Function等への移行を検討してください。
